@@ -1,0 +1,8 @@
+# Scraping
+cloudscraper>=1.2.71
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+requests>=2.31.0
+
+# Kaggle API (dataset upload)
+kaggle>=1.6.0

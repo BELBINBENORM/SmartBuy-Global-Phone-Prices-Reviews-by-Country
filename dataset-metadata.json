@@ -1,0 +1,44 @@
+{
+  "title": "SmartBuy: Global Phone Prices & Reviews by Country",
+  "id": "YOUR_KAGGLE_USERNAME/smartbuy-global-phone-prices-reviews",
+  "licenses": [
+    {
+      "name": "CC BY-NC-SA 4.0"
+    }
+  ],
+  "keywords": [
+    "smartphones",
+    "mobile phones",
+    "prices",
+    "reviews",
+    "global",
+    "consumer electronics",
+    "market research",
+    "brand comparison",
+    "currently available"
+  ],
+  "collaborators": [],
+  "data": [
+    {
+      "description": "Currently-available smartphone prices per country and review scores per model per brand. Updated monthly. Sources: GSMArena (expert + user scores, opinion count, availability status, launch year) × Kimovil (retail prices across 50+ countries).",
+      "name": "phones",
+      "path": "phones.csv",
+      "schema": {
+        "fields": [
+          { "name": "brand",          "title": "Phone manufacturer",                                                    "type": "string"  },
+          { "name": "model",          "title": "Phone model name",                                                      "type": "string"  },
+          { "name": "availability",   "title": "Availability status from GSMArena (Available / Discontinued / etc.)",   "type": "string"  },
+          { "name": "date_launched",  "title": "Year the phone was announced (from GSMArena specs)",                    "type": "integer" },
+          { "name": "gsmarena_score", "title": "Expert review score 0-100 from GSMArena (empty if unreviewed)",         "type": "number"  },
+          { "name": "user_rating",    "title": "Crowd user rating out of 10 from GSMArena",                            "type": "number"  },
+          { "name": "num_opinions",   "title": "Number of user opinions/votes behind user_rating",                     "type": "integer" },
+          { "name": "country",        "title": "Country where the retail price was scraped",                           "type": "string"  },
+          { "name": "price_usd",      "title": "Retail price converted to USD",                                        "type": "number"  },
+          { "name": "currency",       "title": "Local currency code or symbol",                                        "type": "string"  },
+          { "name": "price_local",    "title": "Retail price in local currency",                                       "type": "number"  },
+          { "name": "phone_url",      "title": "GSMArena detail page URL",                                             "type": "string"  }
+        ]
+      }
+    }
+  ]
+}
