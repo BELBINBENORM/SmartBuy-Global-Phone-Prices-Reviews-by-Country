@@ -1,0 +1,104 @@
+name: Update Kaggle Dataset
+
+on:
+  schedule:
+    - cron: "0 2 1 * *"   # 1st of every month at 02:00 UTC
+  workflow_dispatch:        # Manual trigger from GitHub UI
+
+jobs:
+  run-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: python scraper.py
+        env:
+          PYTHONUNBUFFERED: "1"
+
+      - name: Verify output
+        run: |
+          if [ ! -f "phones.csv" ]; then
+            echo "❌ phones.csv not found — scraper failed"
+            exit 1
+          fi
+          ROWS=$(wc -l < phones.csv)
+          echo "✅ phones.csv has $ROWS lines (including header)"
+          if [ "$ROWS" -lt 10 ]; then
+            echo "❌ Too few rows — something went wrong"
+            exit 1
+          fi
+          head -3 phones.csv
+
+      - name: Patch dataset title with min launch year
+        run: |
+          MIN_YEAR=$(python3 -c "
+          import csv, sys
+          years = []
+          with open('phones.csv', newline='', encoding='utf-8') as f:
+              for row in csv.DictReader(f):
+                  y = row.get('date_launched', '').strip()
+                  if y.isdigit() and 1990 <= int(y) <= 2100:
+                      years.append(int(y))
+          print(min(years) if years else 2020)
+          ")
+          echo "Min launch year in data: $MIN_YEAR"
+          # Update the title in dataset-metadata.json
+          python3 -c "
+          import json
+          with open('dataset-metadata.json') as f:
+              meta = json.load(f)
+          meta['title'] = f'Global Smartphone Prices & Reviews Since $MIN_YEAR'
+          with open('dataset-metadata.json', 'w') as f:
+              json.dump(meta, f, indent=2)
+          print('Title updated:', meta['title'])
+          "
+
+      - name: Configure Kaggle credentials
+        run: |
+          mkdir -p ~/.kaggle
+          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' \
+            > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Stage files for Kaggle upload
+        run: |
+          mkdir -p kaggle_upload
+          cp phones.csv kaggle_upload/
+          cp dataset-metadata.json kaggle_upload/
+          echo "Staged files:"
+          ls -lh kaggle_upload/
+
+      - name: Create or update Kaggle dataset
+        run: |
+          DATASET_ID=$(python3 -c "
+          import json
+          with open('dataset-metadata.json') as f:
+              print(json.load(f)['id'])
+          ")
+          echo "Dataset ID: $DATASET_ID"
+
+          if kaggle datasets status "$DATASET_ID" 2>/dev/null | grep -q "ready\|private\|error"; then
+            echo "📦 Dataset exists — creating new version..."
+            kaggle datasets version \
+              --path kaggle_upload \
+              --message "Monthly refresh $(date -u +%Y-%m)" \
+              --dir-mode zip
+          else
+            echo "🆕 First run — creating dataset..."
+            kaggle datasets create \
+              --path kaggle_upload \
+              --dir-mode zip
+          fi
