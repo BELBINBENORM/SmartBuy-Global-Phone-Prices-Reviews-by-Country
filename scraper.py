@@ -30,9 +30,11 @@ BRANDS: list | None = None
 PHONES_PER_BRAND = None          # None = all phones per brand (recommended)
 AVAILABLE_ONLY   = True          # True = skip Discontinued / Cancelled / Rumoured
 OUT_FILE         = Path("phones.csv")
-SLEEP_MIN        = 1.5           # seconds between requests (be polite)
-SLEEP_MAX        = 3.0
-MAX_RETRIES      = 3
+SLEEP_MIN        = 2.0           # seconds between requests (be polite)
+SLEEP_MAX        = 4.0
+SLEEP_BRAND      = 5.0           # extra pause between brands (avoids 429 bursts)
+MAX_RETRIES      = 5
+RETRY_429_WAIT   = 60            # seconds to wait after a 429 before retrying
 
 GSMARENA_BASE = "https://www.gsmarena.com"
 KIMOVIL_BASE  = "https://www.kimovil.com"
@@ -81,11 +83,17 @@ def _get(url, referer=GSMARENA_BASE):
     for attempt in range(MAX_RETRIES):
         try:
             r = SESSION.get(url, timeout=20)
+            if r.status_code == 429:
+                wait = RETRY_429_WAIT * (attempt + 1)
+                log.warning("  429 rate-limited on %s — waiting %ds before retry %d/%d",
+                            url, wait, attempt+1, MAX_RETRIES)
+                time.sleep(wait)
+                continue
             r.raise_for_status()
             return BeautifulSoup(r.text, "html.parser")
         except Exception as exc:
             log.warning("  attempt %d/%d failed for %s: %s", attempt+1, MAX_RETRIES, url, exc)
-            time.sleep(2 ** attempt)
+            time.sleep(min(30, 4 ** attempt))
     log.error("  gave up on %s", url)
     return None
 
@@ -109,8 +117,9 @@ def get_all_brands():
         href = a["href"]
         if "-phones-" not in href:
             continue
-        # Strip model-count suffix, e.g. "Samsung (1234)" -> "Samsung"
-        name = re.sub(r"\s*\(\d+\)\s*$", "", a.get_text(strip=True)).strip()
+        # GSMArena renders: <a href="samsung-phones-9.php">Samsung<span>1455 devices</span></a>
+        # get_text() gives "Samsung1455 devices" — use the first bare text node instead.
+        name = next((s.strip() for s in a.strings if s.strip() and not re.match(r'^\d+', s.strip())), "")
         if not name or name in seen:
             continue
         seen.add(name)
@@ -369,7 +378,7 @@ def main():
             for a in makers_soup.find_all("a", href=True):
                 if "-phones-" not in a["href"]:
                     continue
-                name = re.sub(r"\s*\(\d+\)\s*$", "", a.get_text(strip=True)).strip()
+                name = next((s.strip() for s in a.strings if s.strip() and not re.match(r'^\d+', s.strip())), "")
                 href = a["href"]
                 url_map[name.lower()] = (
                     href if href.startswith("http") else f"{GSMARENA_BASE}/{href}"
@@ -387,6 +396,7 @@ def main():
             brand     = brand_info["name"]
             brand_url = brand_info["url"]
             log.info("== %s ==", brand)
+            time.sleep(SLEEP_BRAND)   # pause between brands to avoid rate-limiting
 
             phones = get_phone_urls(brand, brand_url, PHONES_PER_BRAND)
             if not phones:
