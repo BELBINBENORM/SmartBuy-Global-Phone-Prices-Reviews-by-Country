@@ -130,10 +130,16 @@ def _parse_sitemap_xml(xml_bytes_or_str):
     return urls
 
 
-async def get_all_price_slugs(context):
+async def get_all_price_slugs(context, page=None):
     """
-    Walk Kimovil's sitemap(s) and return every slug for
-    /en/where-to-buy-and-price/ pages.
+    Walk Kimovil's sitemap(s) and return every phone slug.
+
+    Kimovil does NOT put /where-to-buy-and-price/ URLs in their sitemap.
+    They put /en/find-{slug} (spec pages) instead.  The slug is identical
+    across all page types, so we harvest from any recognised phone URL pattern.
+
+    If the sitemap yields nothing, we fall back to scraping the paginated
+    phone-listing page (/en/phones-list.html).
     """
     log.info("Fetching sitemap index: %s", SITEMAP_IDX)
     raw = await _fetch_bytes(context, SITEMAP_IDX)
@@ -146,24 +152,56 @@ async def get_all_price_slugs(context):
     all_urls = _parse_sitemap_xml(raw)
     log.info("  Sitemap index returned %d URLs", len(all_urls))
 
-    price_slugs = []
+    seen_slugs: set[str] = set()
+    price_slugs: list[str] = []
 
-    def _extract(urls):
-        for u in urls:
-            if "/where-to-buy-and-price/" in u:
+    # Patterns that contain a phone slug as the last path segment.
+    # Kimovil sitemaps use /find-{slug} for spec pages; frequencies pages
+    # use /frequencies/{slug}.  Price pages use /where-to-buy-and-price/{slug}
+    # but are currently absent from the sitemap — keep the check anyway.
+    _PHONE_URL_MARKERS = (
+        "/where-to-buy-and-price/",
+        "/frequencies/",
+    )
+    # /find-{slug} — the slug follows the literal word "find-"
+    _FIND_RE = re.compile(r"/find-([a-z0-9][a-z0-9-]{3,})$")
+
+    def _slug_from_url(u: str):
+        """Return the phone slug embedded in a Kimovil URL, or None."""
+        for marker in _PHONE_URL_MARKERS:
+            if marker in u:
                 slug = u.rstrip("/").split("/")[-1]
+                # Sanity: slugs look like "samsung-galaxy-s24-ultra"
+                if re.match(r"^[a-z0-9][a-z0-9-]{3,}$", slug):
+                    return slug
+        m = _FIND_RE.search(u)
+        if m:
+            return m.group(1)
+        return None
+
+    def _extract(urls: list[str]):
+        sample = urls[:3]
+        if sample:
+            log.info("    Sample URLs: %s", sample)
+        for u in urls:
+            slug = _slug_from_url(u)
+            if slug and slug not in seen_slugs:
+                seen_slugs.add(slug)
                 price_slugs.append(slug)
 
     sub_sitemaps  = [u for u in all_urls if "sitemap" in u.lower() and ".xml" in u]
-    direct_prices = [u for u in all_urls if "/where-to-buy-and-price/" in u]
+    direct_phones = [u for u in all_urls if _slug_from_url(u)]
 
-    if direct_prices:
-        log.info("  Direct price pages in top-level sitemap: %d", len(direct_prices))
-        _extract(direct_prices)
+    if direct_phones:
+        log.info("  Direct phone pages in top-level sitemap: %d", len(direct_phones))
+        _extract(direct_phones)
 
     if sub_sitemaps:
         log.info("  Sub-sitemaps to fetch: %d", len(sub_sitemaps))
-        for sm_url in sub_sitemaps:
+        # Only need one language sitemap — all share the same phone slugs.
+        # Prefer English; fall back to the rest if English yields nothing.
+        en_first = sorted(sub_sitemaps, key=lambda u: (0 if ".en." in u else 1))
+        for sm_url in en_first:
             log.info("    %s", sm_url)
             content = await _fetch_bytes(context, sm_url)
             if not content:
@@ -173,17 +211,78 @@ async def get_all_price_slugs(context):
                     content = gzip.decompress(content)
                 except Exception:
                     pass
-            _extract(_parse_sitemap_xml(content))
+            sub_urls = _parse_sitemap_xml(content)
+            _extract(sub_urls)
+            # Once we have a healthy batch, stop — other language sitemaps
+            # are duplicates of the same slugs.
+            if len(price_slugs) > 500:
+                log.info("    Enough slugs from one sitemap; skipping remaining language sitemaps.")
+                break
 
-    # Deduplicate while preserving order
-    seen, deduped = set(), []
-    for s in price_slugs:
-        if s not in seen:
-            seen.add(s)
-            deduped.append(s)
+    # ── Fallback: paginated phone listing ────────────────────────────────────
+    if not price_slugs:
+        log.warning("Sitemap yielded 0 slugs — falling back to phone listing pages.")
+        if page is None:
+            page = await context.new_page()
+            close_page = True
+        else:
+            close_page = False
+        try:
+            price_slugs = await _scrape_listing_pages(page, seen_slugs)
+        finally:
+            if close_page:
+                await page.close()
 
-    log.info("Total unique phone slugs: %d", len(deduped))
-    return deduped
+    log.info("Total unique phone slugs: %d", len(price_slugs))
+    return price_slugs
+
+
+async def _scrape_listing_pages(page, seen_slugs: set) -> list:
+    """
+    Scrape Kimovil's paginated phone listing as a fallback slug source.
+    URL pattern: /en/phones-list.html?page=N
+    Extracts phone URLs from <a href="/en/find-{slug}"> links.
+    """
+    slugs: list[str] = []
+    _FIND_RE = re.compile(r"/find-([a-z0-9][a-z0-9-]{3,})$")
+    page_num = 1
+
+    while True:
+        url = f"{BASE}/en/phones-list.html" + (f"?page={page_num}" if page_num > 1 else "")
+        log.info("  Listing page %d: %s", page_num, url)
+
+        html = await _fetch_text(page, url, wait_selector="[class*='phone'], a[href*='/find-']")
+        if not html:
+            log.warning("  Failed to fetch listing page %d — stopping.", page_num)
+            break
+
+        soup = BeautifulSoup(html, "html.parser")
+        found_this_page = 0
+        for a in soup.find_all("a", href=True):
+            m = _FIND_RE.search(a["href"])
+            if m:
+                slug = m.group(1)
+                if slug not in seen_slugs:
+                    seen_slugs.add(slug)
+                    slugs.append(slug)
+                    found_this_page += 1
+
+        log.info("    Found %d new slugs (total %d)", found_this_page, len(slugs))
+
+        if found_this_page == 0:
+            log.info("  No new slugs on page %d — listing exhausted.", page_num)
+            break
+
+        # Check for a next-page link
+        next_link = soup.select_one("a[rel='next'], .pagination a[href*='page=']")
+        if not next_link:
+            log.info("  No next-page link found — listing complete.")
+            break
+
+        page_num += 1
+        await _rand_sleep(page)
+
+    return slugs
 
 
 # ── STEP 2: Parse each price page ─────────────────────────────────────────────
@@ -342,11 +441,12 @@ async def main():
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         """)
 
-        # Reuse a single page for all price-page requests (keeps cookies/session)
+        # Reuse a single page for all requests (keeps cookies/session alive)
         page = await context.new_page()
 
         try:
-            slugs = await get_all_price_slugs(context)
+            # Pass the page so the fallback listing-scraper can reuse it
+            slugs = await get_all_price_slugs(context, page)
             if not slugs:
                 log.error("No slugs found — check sitemap URLs.")
                 return
