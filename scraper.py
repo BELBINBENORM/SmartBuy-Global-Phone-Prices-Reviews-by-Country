@@ -1,48 +1,42 @@
 """
 SmartBuy: Global Phone Prices & Reviews by Country
 ====================================================
-Scrapes all currently-buyable smartphones from two sources:
-  • GSMArena  — full brand/model catalogue, specs, expert score, user rating,
-                user opinion count, availability status, launch year
-  • Kimovil   — retail prices per country (50+ countries)
+Source: Kimovil.com  (single source — prices + reviews + all brands)
 
-Output: phones.csv
-Columns: brand, model, availability, date_launched, gsmarena_score,
-         user_rating, num_opinions, country, price_usd, currency,
-         price_local, phone_url
+Strategy (no more GSMArena):
+  1. Fetch Kimovil's XML sitemap  → all phone URLs instantly, no pagination,
+     no rate-limiting (sitemaps are meant for crawlers)
+  2. For each phone slug, GET /en/where-to-buy-and-price/{slug}
+     → prices per country + user score + review count
+  3. Write rows to phones.csv
+
+Output columns:
+  brand, model, variant, rating, num_reviews,
+  country, price_usd, currency, price_local, phone_url
 """
 
 import csv
+import gzip
 import logging
 import random
 import re
 import time
+from io import BytesIO
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Set to a list of brand name strings to scrape only those brands,
-# or leave as None to auto-discover ALL brands from GSMArena.
-BRANDS: list | None = None
+OUT_FILE    = Path("phones.csv")
+SLEEP_MIN   = 1.5        # seconds between price-page requests
+SLEEP_MAX   = 3.5
+MAX_RETRIES = 4
+RETRY_WAIT  = 30         # seconds to pause on 429
 
-PHONES_PER_BRAND = None          # None = all phones per brand (recommended)
-AVAILABLE_ONLY   = True          # True = skip Discontinued / Cancelled / Rumoured
-OUT_FILE         = Path("phones.csv")
-SLEEP_MIN        = 2.0           # seconds between requests (be polite)
-SLEEP_MAX        = 4.0
-SLEEP_BRAND      = 5.0           # extra pause between brands (avoids 429 bursts)
-MAX_RETRIES      = 5
-RETRY_429_WAIT   = 60            # seconds to wait after a 429 before retrying
-
-GSMARENA_BASE = "https://www.gsmarena.com"
-KIMOVIL_BASE  = "https://www.kimovil.com"
-
-# Availability keywords that mean "on sale right now"
-_AVAILABLE_KEYWORDS = {"available", "on sale", "launched"}
-_SKIP_KEYWORDS      = {"discontinued", "cancelled", "canceled",
-                       "rumoured", "rumored", "coming soon", "not released"}
+BASE        = "https://www.kimovil.com"
+SITEMAP_IDX = f"{BASE}/en/sitemap.xml"   # or sitemap-index.xml
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -53,7 +47,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── HTTP session ──────────────────────────────────────────────────────────────
-_USER_AGENTS = [
+_UAS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
@@ -62,13 +56,12 @@ _USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 ]
 
-SESSION = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "mobile": False}
-)
+SESSION = requests.Session()
 SESSION.headers.update({
     "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
+    "Referer":         BASE,
 })
 
 
@@ -76,372 +69,295 @@ def _sleep():
     time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
 
 
-def _get(url, referer=GSMARENA_BASE):
-    """Fetch URL with retries; return BeautifulSoup or None."""
-    SESSION.headers["User-Agent"] = random.choice(_USER_AGENTS)
-    SESSION.headers["Referer"]    = referer
+def _get_raw(url, binary=False):
+    """Fetch URL; return response text (or bytes if binary=True), or None."""
+    SESSION.headers["User-Agent"] = random.choice(_UAS)
     for attempt in range(MAX_RETRIES):
         try:
-            r = SESSION.get(url, timeout=20)
+            r = SESSION.get(url, timeout=30)
             if r.status_code == 429:
-                wait = RETRY_429_WAIT * (attempt + 1)
-                log.warning("  429 rate-limited on %s — waiting %ds before retry %d/%d",
-                            url, wait, attempt+1, MAX_RETRIES)
+                wait = RETRY_WAIT * (attempt + 1)
+                log.warning("429 on %s — sleeping %ds (attempt %d/%d)",
+                            url, wait, attempt + 1, MAX_RETRIES)
                 time.sleep(wait)
                 continue
             r.raise_for_status()
-            return BeautifulSoup(r.text, "html.parser")
+            return r.content if binary else r.text
         except Exception as exc:
-            log.warning("  attempt %d/%d failed for %s: %s", attempt+1, MAX_RETRIES, url, exc)
-            time.sleep(min(30, 4 ** attempt))
-    log.error("  gave up on %s", url)
+            log.warning("attempt %d/%d failed — %s: %s", attempt + 1, MAX_RETRIES, url, exc)
+            time.sleep(10 * (attempt + 1))
+    log.error("gave up: %s", url)
     return None
 
 
-# ── GSMArena: discover all brands ─────────────────────────────────────────────
+def _get_soup(url):
+    html = _get_raw(url)
+    if html is None:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    # Sanity check: if page looks like a bot-block, return None
+    text = soup.get_text()
+    if len(text.strip()) < 200:
+        log.warning("Suspiciously short page — possible bot block: %s", url)
+        log.warning("  Content preview: %s", text[:200])
+        return None
+    return soup
 
-def get_all_brands():
+
+# ── STEP 1: Collect all phone slugs from sitemap ──────────────────────────────
+
+def _parse_sitemap_xml(xml_text):
+    """Extract all <loc> URLs from a sitemap XML string."""
+    urls = []
+    try:
+        root = ET.fromstring(xml_text)
+        ns   = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        for loc in root.findall(".//sm:loc", ns):
+            if loc.text:
+                urls.append(loc.text.strip())
+    except ET.ParseError as e:
+        log.error("XML parse error: %s", e)
+    return urls
+
+
+def get_all_price_slugs():
     """
-    Scrape GSMArena makers.php3 and return every brand as
-    {"name": str, "url": str}.  Single HTTP call covers all brands.
+    Walk Kimovil's sitemap(s) and return all slugs for
+    /en/where-to-buy-and-price/ pages (one per phone model/variant).
     """
-    log.info("Fetching brand list from GSMArena...")
-    soup = _get(f"{GSMARENA_BASE}/makers.php3")
-    _sleep()
+    log.info("Fetching sitemap index: %s", SITEMAP_IDX)
+    xml = _get_raw(SITEMAP_IDX)
+    if not xml:
+        # Try alternate name
+        log.info("Trying alternate sitemap URL...")
+        xml = _get_raw(f"{BASE}/sitemap.xml")
+    if not xml:
+        raise RuntimeError("Could not fetch Kimovil sitemap.")
+
+    # Could be a sitemap index (points to sub-sitemaps) or a direct sitemap
+    all_urls = _parse_sitemap_xml(xml)
+    log.info("  sitemap index returned %d URLs", len(all_urls))
+
+    price_slugs = []
+
+    def _extract_from_url_list(urls):
+        for u in urls:
+            if "/where-to-buy-and-price/" in u:
+                slug = u.rstrip("/").split("/")[-1]
+                price_slugs.append(slug)
+
+    # If index contains sub-sitemap URLs, fetch each one
+    sub_sitemaps = [u for u in all_urls if "sitemap" in u.lower() and u.endswith(".xml")]
+    direct_price = [u for u in all_urls if "/where-to-buy-and-price/" in u]
+
+    if direct_price:
+        log.info("  Direct price pages in top-level sitemap: %d", len(direct_price))
+        _extract_from_url_list(direct_price)
+
+    if sub_sitemaps:
+        log.info("  Sub-sitemaps to fetch: %d", len(sub_sitemaps))
+        for sm_url in sub_sitemaps:
+            log.info("    Fetching sub-sitemap: %s", sm_url)
+            content = _get_raw(sm_url, binary=True)
+            if not content:
+                continue
+            # Handle gzipped sitemaps (.xml.gz)
+            if sm_url.endswith(".gz"):
+                try:
+                    content = gzip.decompress(content)
+                except Exception:
+                    pass
+            sub_urls = _parse_sitemap_xml(content.decode("utf-8", errors="replace"))
+            _extract_from_url_list(sub_urls)
+            _sleep()
+
+    # Deduplicate
+    seen = set()
+    deduped = []
+    for s in price_slugs:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+
+    log.info("Total unique phone slugs: %d", len(deduped))
+    return deduped
+
+
+# ── STEP 2: Scrape each price page ───────────────────────────────────────────
+
+def parse_price_page(slug):
+    """
+    Scrape /en/where-to-buy-and-price/{slug}.
+    Returns dict:
+      brand, model, variant, rating, num_reviews,
+      prices: [{country, price_usd, currency, price_local}]
+    """
+    url  = f"{BASE}/en/where-to-buy-and-price/{slug}"
+    soup = _get_soup(url)
     if not soup:
-        raise RuntimeError("Could not load GSMArena brand list.")
+        return None
 
-    brands = []
-    seen   = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "-phones-" not in href:
-            continue
-        # GSMArena renders: <a href="samsung-phones-9.php">Samsung<span>1455 devices</span></a>
-        # get_text() gives "Samsung1455 devices" — use the first bare text node instead.
-        name = next((s.strip() for s in a.strings if s.strip() and not re.match(r'^\d+', s.strip())), "")
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        url = href if href.startswith("http") else f"{GSMARENA_BASE}/{href}"
-        brands.append({"name": name, "url": url})
+    # ── Brand / Model ─────────────────────────────────────────────────────────
+    brand = model = variant = ""
 
-    log.info("  Found %d brands", len(brands))
-    return brands
+    h1 = soup.find("h1")
+    if h1:
+        raw = h1.get_text(strip=True)
+        # Strip "price and where to buy" suffix
+        raw = re.sub(r"\s*[-–|]?\s*(price|where to buy).*", "", raw, flags=re.I).strip()
+        # First word = brand, rest = model
+        parts = raw.split(None, 1)
+        brand = parts[0] if parts else ""
+        model = parts[1] if len(parts) > 1 else ""
 
+    # Variant: storage/RAM sometimes in h2 or sub-heading
+    h2 = soup.find("h2")
+    if h2:
+        v = h2.get_text(strip=True)
+        if re.search(r"\d+\s*(GB|TB|MB)", v, re.I):
+            variant = v
 
-# ── GSMArena: brand page -> phone URLs ────────────────────────────────────────
-
-def get_phone_urls(brand, brand_url, limit):
-    """
-    Paginate GSMArena brand listing -> list of {brand, model, phone_url}.
-    """
-    phones   = []
-    page_url = brand_url
-
-    while page_url:
-        soup = _get(page_url)
-        _sleep()
-        if not soup:
-            break
-
-        for li in soup.select("div.makers ul li"):
-            a = li.find("a", href=True)
-            if not a:
-                continue
-            href = a["href"]
-            if not re.search(r"[\w]+-[\w_]+_\d+\.php", href):
-                continue
-
-            strong = a.find("strong")
-            model  = strong.get_text(strip=True) if strong else a.get_text(strip=True)
-            if not model:
-                continue
-
-            phones.append({
-                "brand"    : brand,
-                "model"    : model,
-                "phone_url": href if href.startswith("http") else f"{GSMARENA_BASE}/{href}",
-            })
-
-            if limit and len(phones) >= limit:
-                return phones
-
-        nxt = soup.select_one("a.pages-next") or soup.select_one("a[title='Next page']")
-        if nxt and nxt.get("href"):
-            h = nxt["href"]
-            page_url = h if h.startswith("http") else f"{GSMARENA_BASE}/{h}"
-        else:
-            break
-
-    log.info("  %s: %d phones found", brand, len(phones))
-    return phones
-
-
-# ── GSMArena: phone detail page ───────────────────────────────────────────────
-
-def get_phone_details(phone_url):
-    """
-    Scrape a GSMArena phone detail page.
-
-    Returns dict with keys:
-        availability   - "Available" | "Discontinued" | "Coming soon" | ""
-        date_launched  - 4-digit year string, e.g. "2024"
-        gsmarena_score - expert review score 0-100 (empty if unreviewed)
-        user_rating    - crowd rating out of 10
-        num_opinions   - number of user votes behind user_rating
-    """
-    result = {
-        "availability"  : "",
-        "date_launched" : "",
-        "gsmarena_score": "",
-        "user_rating"   : "",
-        "num_opinions"  : "",
-    }
-
-    soup = _get(phone_url)
-    _sleep()
-    if not soup:
-        return result
-
-    # ── Specs table rows ──────────────────────────────────────────────────────
-    for ttl in soup.select("td.ttl"):
-        label = ttl.get_text(strip=True).lower()
-        nfo   = ttl.find_next_sibling("td", class_="nfo")
-        if not nfo:
-            continue
-        nfo_text = nfo.get_text(strip=True)
-
-        if "announced" in label and not result["date_launched"]:
-            m = re.search(r"\b(20\d{2}|19\d{2})\b", nfo_text)
+    # ── Rating ────────────────────────────────────────────────────────────────
+    rating = num_reviews = ""
+    for sel in ["[itemprop='ratingValue']", ".rating-value", ".score-value",
+                "[class*='rating'] [class*='value']", ".dxrating"]:
+        el = soup.select_one(sel)
+        if el:
+            m = re.search(r"[\d.]+", el.get_text())
             if m:
-                result["date_launched"] = m.group()
-
-        if "status" in label and not result["availability"]:
-            lower = nfo_text.lower()
-            if any(k in lower for k in _AVAILABLE_KEYWORDS):
-                result["availability"] = "Available"
-            else:
-                result["availability"] = nfo_text.split(".")[0].strip()
-
-    # ── Expert / GSMArena review score ────────────────────────────────────────
-    for sel in [
-        ".score-specs-review .score-total",
-        ".review-score",
-        "a.link-review span",
-        "[class*='score-total']",
-    ]:
-        score_el = soup.select_one(sel)
-        if score_el:
-            m = re.search(r"\d+", score_el.get_text(strip=True))
-            if m:
-                result["gsmarena_score"] = m.group()
+                rating = m.group()
                 break
 
-    if not result["gsmarena_score"]:
-        for meta in soup.find_all("meta"):
-            if "score" in str(meta.get("property", "")).lower():
-                m = re.search(r"\d+", meta.get("content", ""))
-                if m:
-                    result["gsmarena_score"] = m.group()
-                    break
+    for sel in ["[itemprop='ratingCount']", ".rating-count", ".reviews-count",
+                "[class*='votes']", "[class*='review-count']"]:
+        el = soup.select_one(sel)
+        if el:
+            m = re.search(r"\d+", el.get_text())
+            if m:
+                num_reviews = m.group()
+                break
 
-    # ── User rating (itemprop is the canonical selector on GSMArena) ──────────
-    rating_el = soup.select_one("[itemprop='ratingValue']")
-    if not rating_el:
-        rating_el = (
-            soup.select_one(".rating-link .link-spoilers")
-            or soup.select_one(".opinion-score")
-        )
-    if rating_el:
-        m = re.search(r"[\d.]+", rating_el.get_text(strip=True))
-        if m:
-            result["user_rating"] = m.group()
+    # ── Prices by country ─────────────────────────────────────────────────────
+    prices      = []
+    seen_ctries = set()
 
-    # ── Number of user opinions behind the rating ─────────────────────────────
-    count_el = soup.select_one("[itemprop='ratingCount']")
-    if not count_el:
-        count_el = (
-            soup.select_one(".rating-count")
-            or soup.select_one("[class*='opinion-count']")
-        )
-    if count_el:
-        m = re.search(r"[\d,]+", count_el.get_text(strip=True))
-        if m:
-            result["num_opinions"] = m.group().replace(",", "")
+    # Try multiple table/row selectors
+    rows = (soup.select("table tr")
+            or soup.select("[class*='price'] tr")
+            or soup.select("[class*='country'] tr"))
 
-    return result
-
-
-# ── Kimovil: prices per country ───────────────────────────────────────────────
-
-def _kimovil_slug(brand, model):
-    """Convert 'Samsung Galaxy S25 Ultra' -> 'samsung-galaxy-s25-ultra'."""
-    raw = f"{brand} {model}".lower()
-    raw = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
-    return raw
-
-
-def get_kimovil_prices(brand, model):
-    """
-    Scrape Kimovil for retail prices across countries.
-    Returns: [{country, price_usd, currency, price_local}]
-
-    IMPORTANT: uses /en/where-to-buy-and-price/ — the actual price listing page.
-    The old /en/frequency-checker/ URL is a radio-band compatibility checker
-    and does NOT contain retail prices.
-    """
-    slug = _kimovil_slug(brand, model)
-    url  = f"{KIMOVIL_BASE}/en/where-to-buy-and-price/{slug}"
-    soup = _get(url, referer=KIMOVIL_BASE)
-    _sleep()
-    if not soup:
-        return []
-
-    rows = []
-    for tr in soup.select("table.freq-table tr, .price-table tr, "
-                          ".prices-by-country tr, table tr"):
-        cells = tr.find_all(["td", "th"])
+    for tr in rows:
+        cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
         if len(cells) < 2:
             continue
-        country   = cells[0].get_text(strip=True)
-        price_raw = cells[-1].get_text(strip=True)
 
-        if not country or country.lower() in ("country", "region", ""):
+        country = cells[0].strip()
+        if (not country
+                or country.lower() in ("country", "where", "location", "flag", "")
+                or country in seen_ctries):
             continue
 
-        currency_sym  = re.search(r"[A-Z]{3}|[$€£¥₹₩]", price_raw)
-        price_numeric = re.search(r"[\d,]+\.?\d*", price_raw)
+        # Scan cells for a price value
+        price_local = price_usd = currency = ""
+        for cell in cells[1:]:
+            m_price = re.search(r"[\d,]+\.?\d*", cell)
+            m_curr  = re.search(r"\b([A-Z]{3})\b|([€£$¥₹₩₺₴₦])", cell)
+            if m_price:
+                price_local = m_price.group().replace(",", "")
+                if m_curr:
+                    currency = next(g for g in m_curr.groups() if g)
+                break
 
-        if not price_numeric:
-            continue
-
-        price_local = price_numeric.group().replace(",", "")
-        currency    = currency_sym.group() if currency_sym else "?"
-
-        usd_cells = tr.select("td.usd, td.price-usd")
-        price_usd = ""
-        if usd_cells:
-            m = re.search(r"[\d,]+", usd_cells[0].get_text())
+        # Last numeric cell often = USD equivalent
+        for cell in reversed(cells[1:]):
+            m = re.search(r"[\d,]+", cell)
             if m:
                 price_usd = m.group().replace(",", "")
+                break
 
-        rows.append({
-            "country"    : country,
-            "price_usd"  : price_usd,
-            "currency"   : currency,
-            "price_local": price_local,
-        })
+        if price_local and country:
+            seen_ctries.add(country)
+            prices.append({
+                "country":     country,
+                "price_usd":   price_usd,
+                "currency":    currency,
+                "price_local": price_local,
+            })
 
-    # Deduplicate by country (keep first hit)
-    seen  = set()
-    dedup = []
-    for r in rows:
-        if r["country"] not in seen:
-            seen.add(r["country"])
-            dedup.append(r)
-    return dedup
+    # If no table rows matched, log a snippet for debugging
+    if not prices:
+        log.warning("  No prices found for %s — page snippet:", slug)
+        log.warning("  %s", soup.get_text()[:300].replace('\n', ' '))
+
+    return {
+        "brand":       brand,
+        "model":       model,
+        "variant":     variant,
+        "rating":      rating,
+        "num_reviews": num_reviews,
+        "prices":      prices,
+        "phone_url":   url,
+    }
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     fieldnames = [
-        "brand", "model", "availability", "date_launched",
-        "gsmarena_score", "user_rating", "num_opinions",
-        "country", "price_usd", "currency", "price_local",
-        "phone_url",
+        "brand", "model", "variant", "rating", "num_reviews",
+        "country", "price_usd", "currency", "price_local", "phone_url",
     ]
 
-    # Resume support: skip already-written (brand, model, country) combos
-    done = set()
+    # Resume: skip already-written (phone_url, country) pairs
+    done        = set()
     write_header = not OUT_FILE.exists()
     if OUT_FILE.exists():
         with open(OUT_FILE, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                done.add((row["brand"], row["model"], row["country"]))
-        log.info("Resuming -- %d combos already written", len(done))
+                done.add((row.get("phone_url", ""), row.get("country", "")))
+        log.info("Resuming — %d rows already saved", len(done))
 
     out_fh = open(OUT_FILE, "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(out_fh, fieldnames=fieldnames)
     if write_header:
         writer.writeheader()
 
-    # ── Brand list: auto-discover or use override ─────────────────────────────
-    if BRANDS is None:
-        brand_list = get_all_brands()           # all brands from GSMArena
-    else:
-        makers_soup = _get(f"{GSMARENA_BASE}/makers.php3")
-        _sleep()
-        url_map = {}
-        if makers_soup:
-            for a in makers_soup.find_all("a", href=True):
-                if "-phones-" not in a["href"]:
-                    continue
-                name = next((s.strip() for s in a.strings if s.strip() and not re.match(r'^\d+', s.strip())), "")
-                href = a["href"]
-                url_map[name.lower()] = (
-                    href if href.startswith("http") else f"{GSMARENA_BASE}/{href}"
-                )
-        brand_list = []
-        for b in BRANDS:
-            url = url_map.get(b.lower())
-            if url:
-                brand_list.append({"name": b, "url": url})
-            else:
-                log.warning("Brand not found on GSMArena: %s", b)
-
     try:
-        for brand_info in brand_list:
-            brand     = brand_info["name"]
-            brand_url = brand_info["url"]
-            log.info("== %s ==", brand)
-            time.sleep(SLEEP_BRAND)   # pause between brands to avoid rate-limiting
+        slugs = get_all_price_slugs()
+        if not slugs:
+            log.error("No slugs found — check sitemap URLs above.")
+            return
 
-            phones = get_phone_urls(brand, brand_url, PHONES_PER_BRAND)
-            if not phones:
-                log.warning("  No phones found for %s", brand)
+        for i, slug in enumerate(slugs, 1):
+            log.info("[%d/%d] %s", i, len(slugs), slug)
+            data = parse_price_page(slug)
+            _sleep()
+
+            if not data:
                 continue
 
-            for i, phone in enumerate(phones, 1):
-                b, m = phone["brand"], phone["model"]
-                log.info("  [%d/%d] %s %s", i, len(phones), b, m)
+            rows_to_write = data["prices"] or [
+                {"country": "", "price_usd": "", "currency": "", "price_local": ""}
+            ]
 
-                details = get_phone_details(phone["phone_url"])
-
-                # ── Availability filter ───────────────────────────────────────
-                if AVAILABLE_ONLY:
-                    status = details["availability"].lower()
-                    if status and not any(k in status for k in _AVAILABLE_KEYWORDS):
-                        log.info("    -> skipping (%s)", details["availability"])
-                        continue
-
-                prices = get_kimovil_prices(b, m)
-                if not prices:
-                    prices = [{"country": "", "price_usd": "",
-                               "currency": "", "price_local": ""}]
-
-                for price_row in prices:
-                    key = (b, m, price_row["country"])
-                    if key in done:
-                        continue
-                    done.add(key)
-
-                    writer.writerow({
-                        "brand"         : b,
-                        "model"         : m,
-                        "availability"  : details["availability"],
-                        "date_launched" : details["date_launched"],
-                        "gsmarena_score": details["gsmarena_score"],
-                        "user_rating"   : details["user_rating"],
-                        "num_opinions"  : details["num_opinions"],
-                        "country"       : price_row["country"],
-                        "price_usd"     : price_row["price_usd"],
-                        "currency"      : price_row["currency"],
-                        "price_local"   : price_row["price_local"],
-                        "phone_url"     : phone["phone_url"],
-                    })
-                out_fh.flush()
+            for pr in rows_to_write:
+                key = (data["phone_url"], pr["country"])
+                if key in done:
+                    continue
+                done.add(key)
+                writer.writerow({
+                    "brand":       data["brand"],
+                    "model":       data["model"],
+                    "variant":     data["variant"],
+                    "rating":      data["rating"],
+                    "num_reviews": data["num_reviews"],
+                    "country":     pr["country"],
+                    "price_usd":   pr["price_usd"],
+                    "currency":    pr["currency"],
+                    "price_local": pr["price_local"],
+                    "phone_url":   data["phone_url"],
+                })
+            out_fh.flush()
 
     finally:
         out_fh.close()
