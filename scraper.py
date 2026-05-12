@@ -3,40 +3,42 @@ SmartBuy: Global Phone Prices & Reviews by Country
 ====================================================
 Source: Kimovil.com  (single source — prices + reviews + all brands)
 
-Strategy (no more GSMArena):
-  1. Fetch Kimovil's XML sitemap  → all phone URLs instantly, no pagination,
-     no rate-limiting (sitemaps are meant for crawlers)
-  2. For each phone slug, GET /en/where-to-buy-and-price/{slug}
-     → prices per country + user score + review count
-  3. Write rows to phones.csv
+Strategy:
+  1. Use Playwright (real Chromium) to bypass bot detection.
+  2. Fetch Kimovil's XML sitemap → all phone slugs, no pagination.
+  3. For each slug, navigate to /en/where-to-buy-and-price/{slug}
+     → prices per country + user score + review count.
+  4. Write rows to phones.csv.
+
+One-time setup (after pip install):
+  python -m playwright install chromium
 
 Output columns:
   brand, model, variant, rating, num_reviews,
   country, price_usd, currency, price_local, phone_url
 """
 
+import asyncio
 import csv
 import gzip
 import logging
 import random
 import re
-import time
-from io import BytesIO
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-import requests
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # ── Config ────────────────────────────────────────────────────────────────────
 OUT_FILE    = Path("phones.csv")
-SLEEP_MIN   = 1.5        # seconds between price-page requests
-SLEEP_MAX   = 3.5
-MAX_RETRIES = 4
-RETRY_WAIT  = 30         # seconds to pause on 429
+SLEEP_MIN   = 1500        # ms between navigations
+SLEEP_MAX   = 3500
+MAX_RETRIES = 3
+RETRY_WAIT  = 30_000      # ms to pause on rate-limit signals
 
 BASE        = "https://www.kimovil.com"
-SITEMAP_IDX = f"{BASE}/en/sitemap.xml"   # or sitemap-index.xml
+SITEMAP_IDX = f"{BASE}/en/sitemap.xml"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -46,72 +48,80 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── HTTP session ──────────────────────────────────────────────────────────────
-_UAS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-]
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer":         BASE,
-})
+# ── Playwright helpers ────────────────────────────────────────────────────────
+
+async def _rand_sleep(page):
+    """Human-paced delay between requests."""
+    ms = random.randint(SLEEP_MIN, SLEEP_MAX)
+    await page.wait_for_timeout(ms)
 
 
-def _sleep():
-    time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
-
-
-def _get_raw(url, binary=False):
-    """Fetch URL; return response text (or bytes if binary=True), or None."""
-    SESSION.headers["User-Agent"] = random.choice(_UAS)
-    for attempt in range(MAX_RETRIES):
+async def _fetch_text(page, url, wait_selector=None):
+    """
+    Navigate to *url* in the existing page and return its full HTML.
+    Retries up to MAX_RETRIES times on transient failures.
+    Returns None if every attempt fails.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = SESSION.get(url, timeout=30)
-            if r.status_code == 429:
-                wait = RETRY_WAIT * (attempt + 1)
-                log.warning("429 on %s — sleeping %ds (attempt %d/%d)",
-                            url, wait, attempt + 1, MAX_RETRIES)
-                time.sleep(wait)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+
+            # Optional: wait for a key element to confirm the page rendered
+            if wait_selector:
+                try:
+                    await page.wait_for_selector(wait_selector, timeout=10_000)
+                except PWTimeout:
+                    pass  # selector missing is fine — we'll handle it downstream
+
+            # Basic bot-wall detection
+            body_text = await page.inner_text("body")
+            if len(body_text.strip()) < 200:
+                log.warning("Suspiciously short body on attempt %d — %s", attempt, url)
+                await page.wait_for_timeout(RETRY_WAIT)
                 continue
-            r.raise_for_status()
-            return r.content if binary else r.text
+
+            return await page.content()
+
+        except PWTimeout:
+            log.warning("Timeout attempt %d/%d — %s", attempt, MAX_RETRIES, url)
+            await page.wait_for_timeout(10_000 * attempt)
         except Exception as exc:
-            log.warning("attempt %d/%d failed — %s: %s", attempt + 1, MAX_RETRIES, url, exc)
-            time.sleep(10 * (attempt + 1))
-    log.error("gave up: %s", url)
+            log.warning("Error attempt %d/%d — %s: %s", attempt, MAX_RETRIES, url, exc)
+            await page.wait_for_timeout(10_000 * attempt)
+
+    log.error("Gave up: %s", url)
     return None
 
 
-def _get_soup(url):
-    html = _get_raw(url)
-    if html is None:
-        return None
-    soup = BeautifulSoup(html, "html.parser")
-    # Sanity check: if page looks like a bot-block, return None
-    text = soup.get_text()
-    if len(text.strip()) < 200:
-        log.warning("Suspiciously short page — possible bot block: %s", url)
-        log.warning("  Content preview: %s", text[:200])
-        return None
-    return soup
-
-
-# ── STEP 1: Collect all phone slugs from sitemap ──────────────────────────────
-
-def _parse_sitemap_xml(xml_text):
-    """Extract all <loc> URLs from a sitemap XML string."""
-    urls = []
+async def _fetch_bytes(context, url):
+    """
+    Download binary content (e.g. gzipped sitemaps) via a new browser page
+    by intercepting the response body.  Falls back to None on failure.
+    """
+    page = await context.new_page()
+    body = None
     try:
-        root = ET.fromstring(xml_text)
-        ns   = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        resp = await page.goto(url, wait_until="commit", timeout=30_000)
+        if resp and resp.ok:
+            body = await resp.body()
+    except Exception as exc:
+        log.warning("Binary fetch failed for %s: %s", url, exc)
+    finally:
+        await page.close()
+    return body
+
+
+# ── STEP 1: Collect phone slugs from sitemap ──────────────────────────────────
+
+def _parse_sitemap_xml(xml_bytes_or_str):
+    """Return all <loc> URLs from a sitemap XML blob."""
+    urls = []
+    if isinstance(xml_bytes_or_str, str):
+        xml_bytes_or_str = xml_bytes_or_str.encode()
+    try:
+        root = ET.fromstring(xml_bytes_or_str)
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
         for loc in root.findall(".//sm:loc", ns):
             if loc.text:
                 urls.append(loc.text.strip())
@@ -120,60 +130,53 @@ def _parse_sitemap_xml(xml_text):
     return urls
 
 
-def get_all_price_slugs():
+async def get_all_price_slugs(context):
     """
-    Walk Kimovil's sitemap(s) and return all slugs for
-    /en/where-to-buy-and-price/ pages (one per phone model/variant).
+    Walk Kimovil's sitemap(s) and return every slug for
+    /en/where-to-buy-and-price/ pages.
     """
     log.info("Fetching sitemap index: %s", SITEMAP_IDX)
-    xml = _get_raw(SITEMAP_IDX)
-    if not xml:
-        # Try alternate name
-        log.info("Trying alternate sitemap URL...")
-        xml = _get_raw(f"{BASE}/sitemap.xml")
-    if not xml:
+    raw = await _fetch_bytes(context, SITEMAP_IDX)
+    if not raw:
+        log.info("Trying alternate sitemap URL…")
+        raw = await _fetch_bytes(context, f"{BASE}/sitemap.xml")
+    if not raw:
         raise RuntimeError("Could not fetch Kimovil sitemap.")
 
-    # Could be a sitemap index (points to sub-sitemaps) or a direct sitemap
-    all_urls = _parse_sitemap_xml(xml)
-    log.info("  sitemap index returned %d URLs", len(all_urls))
+    all_urls = _parse_sitemap_xml(raw)
+    log.info("  Sitemap index returned %d URLs", len(all_urls))
 
     price_slugs = []
 
-    def _extract_from_url_list(urls):
+    def _extract(urls):
         for u in urls:
             if "/where-to-buy-and-price/" in u:
                 slug = u.rstrip("/").split("/")[-1]
                 price_slugs.append(slug)
 
-    # If index contains sub-sitemap URLs, fetch each one
-    sub_sitemaps = [u for u in all_urls if "sitemap" in u.lower() and u.endswith(".xml")]
-    direct_price = [u for u in all_urls if "/where-to-buy-and-price/" in u]
+    sub_sitemaps  = [u for u in all_urls if "sitemap" in u.lower() and ".xml" in u]
+    direct_prices = [u for u in all_urls if "/where-to-buy-and-price/" in u]
 
-    if direct_price:
-        log.info("  Direct price pages in top-level sitemap: %d", len(direct_price))
-        _extract_from_url_list(direct_price)
+    if direct_prices:
+        log.info("  Direct price pages in top-level sitemap: %d", len(direct_prices))
+        _extract(direct_prices)
 
     if sub_sitemaps:
         log.info("  Sub-sitemaps to fetch: %d", len(sub_sitemaps))
         for sm_url in sub_sitemaps:
-            log.info("    Fetching sub-sitemap: %s", sm_url)
-            content = _get_raw(sm_url, binary=True)
+            log.info("    %s", sm_url)
+            content = await _fetch_bytes(context, sm_url)
             if not content:
                 continue
-            # Handle gzipped sitemaps (.xml.gz)
             if sm_url.endswith(".gz"):
                 try:
                     content = gzip.decompress(content)
                 except Exception:
                     pass
-            sub_urls = _parse_sitemap_xml(content.decode("utf-8", errors="replace"))
-            _extract_from_url_list(sub_urls)
-            _sleep()
+            _extract(_parse_sitemap_xml(content))
 
-    # Deduplicate
-    seen = set()
-    deduped = []
+    # Deduplicate while preserving order
+    seen, deduped = set(), []
     for s in price_slugs:
         if s not in seen:
             seen.add(s)
@@ -183,41 +186,32 @@ def get_all_price_slugs():
     return deduped
 
 
-# ── STEP 2: Scrape each price page ───────────────────────────────────────────
+# ── STEP 2: Parse each price page ─────────────────────────────────────────────
 
-def parse_price_page(slug):
+def _parse_price_html(html, slug, url):
     """
-    Scrape /en/where-to-buy-and-price/{slug}.
-    Returns dict:
-      brand, model, variant, rating, num_reviews,
-      prices: [{country, price_usd, currency, price_local}]
+    Parse the fully-rendered HTML of a price page.
+    Returns a result dict or None.
     """
-    url  = f"{BASE}/en/where-to-buy-and-price/{slug}"
-    soup = _get_soup(url)
-    if not soup:
-        return None
+    soup = BeautifulSoup(html, "html.parser")
 
-    # ── Brand / Model ─────────────────────────────────────────────────────────
+    # ── Brand / Model ──────────────────────────────────────────────────────────
     brand = model = variant = ""
-
     h1 = soup.find("h1")
     if h1:
         raw = h1.get_text(strip=True)
-        # Strip "price and where to buy" suffix
         raw = re.sub(r"\s*[-–|]?\s*(price|where to buy).*", "", raw, flags=re.I).strip()
-        # First word = brand, rest = model
         parts = raw.split(None, 1)
         brand = parts[0] if parts else ""
         model = parts[1] if len(parts) > 1 else ""
 
-    # Variant: storage/RAM sometimes in h2 or sub-heading
     h2 = soup.find("h2")
     if h2:
         v = h2.get_text(strip=True)
         if re.search(r"\d+\s*(GB|TB|MB)", v, re.I):
             variant = v
 
-    # ── Rating ────────────────────────────────────────────────────────────────
+    # ── Rating ─────────────────────────────────────────────────────────────────
     rating = num_reviews = ""
     for sel in ["[itemprop='ratingValue']", ".rating-value", ".score-value",
                 "[class*='rating'] [class*='value']", ".dxrating"]:
@@ -237,11 +231,9 @@ def parse_price_page(slug):
                 num_reviews = m.group()
                 break
 
-    # ── Prices by country ─────────────────────────────────────────────────────
-    prices      = []
-    seen_ctries = set()
+    # ── Prices by country ──────────────────────────────────────────────────────
+    prices, seen_ctries = [], set()
 
-    # Try multiple table/row selectors
     rows = (soup.select("table tr")
             or soup.select("[class*='price'] tr")
             or soup.select("[class*='country'] tr"))
@@ -257,7 +249,6 @@ def parse_price_page(slug):
                 or country in seen_ctries):
             continue
 
-        # Scan cells for a price value
         price_local = price_usd = currency = ""
         for cell in cells[1:]:
             m_price = re.search(r"[\d,]+\.?\d*", cell)
@@ -268,7 +259,6 @@ def parse_price_page(slug):
                     currency = next(g for g in m_curr.groups() if g)
                 break
 
-        # Last numeric cell often = USD equivalent
         for cell in reversed(cells[1:]):
             m = re.search(r"[\d,]+", cell)
             if m:
@@ -284,10 +274,8 @@ def parse_price_page(slug):
                 "price_local": price_local,
             })
 
-    # If no table rows matched, log a snippet for debugging
     if not prices:
-        log.warning("  No prices found for %s — page snippet:", slug)
-        log.warning("  %s", soup.get_text()[:300].replace('\n', ' '))
+        log.warning("No prices found for %s", slug)
 
     return {
         "brand":       brand,
@@ -300,16 +288,24 @@ def parse_price_page(slug):
     }
 
 
+async def scrape_price_page(page, slug):
+    url  = f"{BASE}/en/where-to-buy-and-price/{slug}"
+    html = await _fetch_text(page, url, wait_selector="table, [class*='price']")
+    if not html:
+        return None
+    return _parse_price_html(html, slug, url)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
+async def main():
     fieldnames = [
         "brand", "model", "variant", "rating", "num_reviews",
         "country", "price_usd", "currency", "price_local", "phone_url",
     ]
 
-    # Resume: skip already-written (phone_url, country) pairs
-    done        = set()
+    # Resume support
+    done         = set()
     write_header = not OUT_FILE.exists()
     if OUT_FILE.exists():
         with open(OUT_FILE, newline="", encoding="utf-8") as f:
@@ -317,53 +313,90 @@ def main():
                 done.add((row.get("phone_url", ""), row.get("country", "")))
         log.info("Resuming — %d rows already saved", len(done))
 
-    out_fh = open(OUT_FILE, "a", newline="", encoding="utf-8")
-    writer = csv.DictWriter(out_fh, fieldnames=fieldnames)
-    if write_header:
-        writer.writeheader()
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",  # hide automation flag
+            ],
+        )
 
-    try:
-        slugs = get_all_price_slugs()
-        if not slugs:
-            log.error("No slugs found — check sitemap URLs above.")
-            return
+        # One persistent browser context mimics a real user profile
+        context = await browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+            timezone_id="America/New_York",
+            java_script_enabled=True,
+        )
 
-        for i, slug in enumerate(slugs, 1):
-            log.info("[%d/%d] %s", i, len(slugs), slug)
-            data = parse_price_page(slug)
-            _sleep()
+        # Mask Playwright's navigator.webdriver fingerprint
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+        """)
 
-            if not data:
-                continue
+        # Reuse a single page for all price-page requests (keeps cookies/session)
+        page = await context.new_page()
 
-            rows_to_write = data["prices"] or [
-                {"country": "", "price_usd": "", "currency": "", "price_local": ""}
-            ]
+        try:
+            slugs = await get_all_price_slugs(context)
+            if not slugs:
+                log.error("No slugs found — check sitemap URLs.")
+                return
 
-            for pr in rows_to_write:
-                key = (data["phone_url"], pr["country"])
-                if key in done:
-                    continue
-                done.add(key)
-                writer.writerow({
-                    "brand":       data["brand"],
-                    "model":       data["model"],
-                    "variant":     data["variant"],
-                    "rating":      data["rating"],
-                    "num_reviews": data["num_reviews"],
-                    "country":     pr["country"],
-                    "price_usd":   pr["price_usd"],
-                    "currency":    pr["currency"],
-                    "price_local": pr["price_local"],
-                    "phone_url":   data["phone_url"],
-                })
-            out_fh.flush()
+            out_fh = open(OUT_FILE, "a", newline="", encoding="utf-8")
+            writer = csv.DictWriter(out_fh, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
 
-    finally:
-        out_fh.close()
+            try:
+                for i, slug in enumerate(slugs, 1):
+                    log.info("[%d/%d] %s", i, len(slugs), slug)
+                    data = await scrape_price_page(page, slug)
+                    await _rand_sleep(page)
+
+                    if not data:
+                        continue
+
+                    rows_to_write = data["prices"] or [
+                        {"country": "", "price_usd": "", "currency": "", "price_local": ""}
+                    ]
+                    for pr in rows_to_write:
+                        key = (data["phone_url"], pr["country"])
+                        if key in done:
+                            continue
+                        done.add(key)
+                        writer.writerow({
+                            "brand":       data["brand"],
+                            "model":       data["model"],
+                            "variant":     data["variant"],
+                            "rating":      data["rating"],
+                            "num_reviews": data["num_reviews"],
+                            "country":     pr["country"],
+                            "price_usd":   pr["price_usd"],
+                            "currency":    pr["currency"],
+                            "price_local": pr["price_local"],
+                            "phone_url":   data["phone_url"],
+                        })
+                    out_fh.flush()
+
+            finally:
+                out_fh.close()
+
+        finally:
+            await page.close()
+            await context.close()
+            await browser.close()
 
     log.info("Done. Output: %s", OUT_FILE)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
